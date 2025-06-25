@@ -251,126 +251,165 @@
     );
 
     const WelcomePage = () => {
-      const [error, setError] = useState(null);
+  const [error, setError] = useState(null);
+  const mapRef = useRef(null);
+  const mapInitialized = useRef(false);
 
-      useEffect(() => {
-        waitForLeaflet(() => {
-          try {
-            const map = L.map('welcome-map').setView([54.5, -3], 6);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-              maxZoom: 19,
-              attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-            }).addTo(map).on('tileerror', (error, tile) => {
-              console.error('Tile error:', error, tile);
-              setError('Failed to load map tiles');
-            });
+  const initializeMap = () => {
+    if (mapInitialized.current || !window.L || !document.getElementById('welcome-map')) {
+      return;
+    }
+    try {
+      console.log('Initializing Leaflet map for WelcomePage');
+      const map = L.map('welcome-map', {
+        zoomControl: true,
+        minZoom: 5,
+        maxZoom: 10,
+        maxBounds: [[UK_BBOX[1], UK_BBOX[0]], [UK_BBOX[3], UK_BBOX[2]]]
+      }).setView([54.5, -3], 6);
+      mapRef.current = map;
+      mapInitialized.current = true;
 
-            db.collection('outlooks')
-              .where('email', '==', 'admin@example.com')
-              .orderBy('timestamp', 'desc')
-              .limit(1)
-              .get()
-              .then(snapshot => {
-                console.log('Admin outlook query returned', snapshot.size, 'documents');
-                if (snapshot.empty) {
-                  console.warn('No admin outlook found for email: admin@example.com');
-                  setError('No Handry Outlook available');
-                  return;
-                }
-                const data = snapshot.docs[0]?.data();
-                console.log('Admin outlook data:', data);
-                if (!data?.polygons || data.polygons.length === 0) {
-                  console.warn('Admin outlook has no polygons:', data);
-                  setError('No forecast areas available in Handry Outlook');
-                  return;
-                }
-                const parsedPolygons = data.polygons.map(p => {
-                  try {
-                    return {
-                      ...p,
-                      geometry: {
-                        ...p.geometry,
-                        coordinates: JSON.parse(p.geometry.coordinates)
-                      },
-                      properties: {
-                        ...p.properties,
-                        Name: p.properties.Name || 'low risk',
-                        color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk']
-                      }
-                    };
-                  } catch (err) {
-                    console.error('Error parsing polygon:', p, err);
-                    return null;
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+      })
+        .addTo(map)
+        .on('tileerror', (error, tile) => {
+          console.error('Tile error:', error, tile);
+          setError('Failed to load map tiles');
+        });
+
+      // Fetch admin outlook
+      db.collection('outlooks')
+        .where('email', '==', 'admin@example.com')
+        .orderBy('timestamp', 'desc')
+        .limit(1)
+        .get()
+        .then(snapshot => {
+          console.log('Admin outlook query returned', snapshot.size, 'documents');
+          if (snapshot.empty) {
+            console.warn('No admin outlook found for email: admin@example.com');
+            setError('No Handry Outlook available');
+            return;
+          }
+          const data = snapshot.docs[0]?.data();
+          console.log('Admin outlook data:', data);
+          if (!data?.polygons || data.polygons.length === 0) {
+            console.warn('Admin outlook has no polygons:', data);
+            setError('No forecast areas available in Handry Outlook');
+            return;
+          }
+          const parsedPolygons = data.polygons
+            .map(p => {
+              try {
+                return {
+                  ...p,
+                  geometry: {
+                    ...p.geometry,
+                    coordinates: JSON.parse(p.geometry.coordinates)
+                  },
+                  properties: {
+                    ...p.properties,
+                    Name: p.properties.Name || 'low risk',
+                    color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk']
                   }
-                }).filter(p => p !== null);
-                console.log('Parsed polygons for WelcomePage:', parsedPolygons);
+                };
+              } catch (err) {
+                console.error('Error parsing polygon:', p, err);
+                return null;
+              }
+            })
+            .filter(p => p !== null);
+          console.log('Parsed polygons for WelcomePage:', parsedPolygons);
 
-                if (parsedPolygons.length === 0) {
-                  console.warn('No valid polygons after parsing');
-                  setError('Invalid forecast areas in Handry Outlook');
-                  return;
+          if (parsedPolygons.length === 0) {
+            console.warn('No valid polygons after parsing');
+            setError('Invalid forecast areas in Handry Outlook');
+            return;
+          }
+
+          const polygonsByRisk = RISK_ORDER.reduce((acc, risk) => {
+            acc[risk] = parsedPolygons.filter(p => p.properties.Name.toLowerCase() === risk);
+            return acc;
+          }, {});
+          console.log('Polygons by risk:', polygonsByRisk);
+
+          RISK_ORDER.forEach(risk => {
+            if (polygonsByRisk[risk].length > 0) {
+              const style = feature => {
+                const riskLevel = feature.properties.Name?.toLowerCase();
+                const color = RISK_COLORS[riskLevel] || '#66c2a4';
+                if (!RISK_COLORS[riskLevel]) {
+                  console.warn('Invalid risk level:', riskLevel, 'for polygon', feature);
                 }
+                console.log('Assigning color for', feature.properties.Name, ':', color);
+                return {
+                  color,
+                  fillColor: risk === 'severe risk' ? 'transparent' : color, // No fill for severe risk
+                  fillOpacity: risk === 'severe risk' ? 0 : 0.4, // Transparent for severe risk
+                  weight: 2
+                };
+              };
+              const layer = L.geoJSON(polygonsByRisk[risk], { style }).addTo(map);
+              console.log('Added GeoJSON layer for', risk);
+            }
+          });
 
-                const polygonsByRisk = RISK_ORDER.reduce((acc, risk) => {
-                  acc[risk] = parsedPolygons.filter(p => p.properties.Name.toLowerCase() === risk);
-                  return acc;
-                }, {});
-                console.log('Polygons by risk:', polygonsByRisk);
-
-                RISK_ORDER.forEach(risk => {
-                  if (polygonsByRisk[risk].length > 0) {
-                    const layer = L.geoJSON(polygonsByRisk[risk], {
-                      style: feature => {
-                        const riskLevel = feature.properties.Name?.toLowerCase();
-                        const color = RISK_COLORS[riskLevel] || '#66c2a4';
-                        if (!RISK_COLORS[riskLevel]) {
-                          console.warn('Invalid risk level:', riskLevel, 'for polygon', feature);
-                        }
-                        console.log('Assigning color for', feature.properties.Name, ':', color);
-                        return {
-                          color,
-                          fillColor: color,
-                          fillOpacity: 0.4
-                        };
-                      }
-                    }).addTo(map);
-                    console.log('Added GeoJSON layer for', risk);
-                  }
-                });
-                setTimeout(() => {
-                  map.invalidateSize();
-                  console.log('Map size invalidated for WelcomePage');
-                }, 100);
-              })
-              .catch(err => {
-                console.error('Error fetching admin outlook:', err);
-                if (err.code === 'failed-precondition' && err.message.includes('index')) {
-                  setError('Database index required. Please contact the administrator to create an index for outlooks by email and timestamp.');
-                } else {
-                  setError(`Failed to load Handry Outlook data: ${err.message}`);
-                }
-              });
-
-            return () => {
-              console.log('Cleaning up WelcomePage map');
-              map.remove();
-            };
-          } catch (err) {
-            console.error('Error initializing WelcomePage map:', err);
-            setError('Failed to initialize map');
+          // Invalidate map size after data is loaded
+          setTimeout(() => {
+            if (mapRef.current) {
+              mapRef.current.invalidateSize();
+              console.log('Map size invalidated after data load');
+            }
+          }, 100);
+        })
+        .catch(err => {
+          console.error('Error fetching admin outlook:', err);
+          if (err.code === 'failed-precondition' && err.message.includes('index')) {
+            setError('Database index required. Please contact the administrator to create an index for outlooks by email and timestamp.');
+          } else {
+            setError(`Failed to load Handry Outlook data: ${err.message}`);
           }
         });
-      }, []);
+    } catch (err) {
+      console.error('Error initializing WelcomePage map:', err);
+      setError('Failed to initialize map');
+    }
+  };
 
-      return (
-        <div className="p-6 container mx-auto">
-          <h1 className="text-3xl font-bold text-gray-800 mb-4">Welcome to Convective Outlook</h1>
-          {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
-          <p className="text-gray-600 mb-4">View Handry Outlook's forecast below:</p>
-          <div id="welcome-map" className="h-[500px] w-full rounded-lg shadow-md"></div>
-        </div>
-      );
+  useEffect(() => {
+    // Wait for Leaflet and DOM to be ready
+    const checkReady = () => {
+      if (window.L && document.getElementById('welcome-map')) {
+        initializeMap();
+      } else {
+        console.log('Waiting for Leaflet or DOM...');
+        setTimeout(checkReady, 100);
+      }
     };
+    checkReady();
+
+    // Cleanup
+    return () => {
+      if (mapRef.current) {
+        console.log('Cleaning up WelcomePage map');
+        mapRef.current.remove();
+        mapRef.current = null;
+        mapInitialized.current = false;
+      }
+    };
+  }, []);
+
+  return (
+    <div className="p-6 container mx-auto">
+      <h1 className="text-3xl font-bold text-gray-800 mb-4">Welcome to Convective Outlook</h1>
+      {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
+      <p className="text-gray-600 mb-4">View Handry Outlook's forecast below:</p>
+      <div id="welcome-map" className="h-[500px] w-full rounded-lg shadow-md"></div>
+    </div>
+  );
+};
 
     const AccountPage = ({ setUser, setUsername, setEmail }) => {
       const [email, setLocalEmail] = useState('');
