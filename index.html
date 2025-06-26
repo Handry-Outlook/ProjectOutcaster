@@ -1526,7 +1526,266 @@
         </div>
       );
     };
-    
+    const ViewOutlookPage = ({ user }) => {
+      const [outlooks, setOutlooks] = useState([]);
+      const [filteredOutlooks, setFilteredOutlooks] = useState([]);
+      const [selectedOutlook, setSelectedOutlook] = useState(null);
+      const [error, setError] = useState(null);
+      const [dateFilter, setDateFilter] = useState('');
+      const [searchUsername, setSearchUsername] = useState('');
+      const [sortBy, setSortBy] = useState('latest');
+      const mapRef = useRef(null);
+      const geoJsonLayersRef = useRef([]);
+
+      const handleLike = async (outlookId) => {
+        if (!user) {
+          alert('Please log in to like an outlook.');
+          return;
+        }
+        try {
+          const outlookRef = db.collection('outlooks').doc(outlookId);
+          const outlookDoc = await outlookRef.get();
+          const outlookData = outlookDoc.data();
+          const likes = outlookData.likes || [];
+          if (likes.includes(user.uid)) {
+            alert('You have already liked this outlook.');
+            return;
+          }
+          await outlookRef.update({
+            likes: [...likes, user.uid]
+          });
+          setOutlooks(prev => prev.map(o => o.id === outlookId ? { ...o, likes: [...(o.likes || []), user.uid] } : o));
+          setFilteredOutlooks(prev => prev.map(o => o.id === outlookId ? { ...o, likes: [...(o.likes || []), user.uid] } : o));
+          console.log('Liked outlook:', outlookId);
+        } catch (err) {
+          console.error('Error liking outlook:', err);
+          setError('Failed to like outlook');
+        }
+      };
+
+      useEffect(() => {
+        console.log('Fetching outlooks for ViewOutlookPage');
+        db.collection('outlooks')
+          .where('date', '>=', new Date().toISOString().split('T')[0])
+          .get()
+          .then(snapshot => {
+            const outlooksData = snapshot.docs.map(doc => ({
+              id: doc.id,
+              ...doc.data(),
+              createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
+            }));
+            console.log('Fetched future outlooks:', outlooksData);
+            setOutlooks(outlooksData);
+            setFilteredOutlooks(outlooksData);
+            if (outlooksData.length > 0) {
+              setSelectedOutlook(outlooksData[0]);
+            }
+          })
+          .catch(err => {
+            console.error('Error fetching outlooks:', err);
+            setError('Failed to load outlooks');
+          });
+      }, []);
+
+      useEffect(() => {
+        let filtered = outlooks;
+        if (dateFilter) {
+          filtered = filtered.filter(outlook => outlook.date === dateFilter);
+        }
+        if (searchUsername) {
+          filtered = filtered.filter(outlook => outlook.username.toLowerCase().includes(searchUsername.toLowerCase()));
+        }
+        filtered = filtered.sort((a, b) => {
+          if (sortBy === 'latest') {
+            return b.createdAt - a.createdAt;
+          } else if (sortBy === 'mostLikes') {
+            return (b.likes?.length || 0) - (a.likes?.length || 0);
+          }
+          return 0;
+        });
+        setFilteredOutlooks(filtered);
+      }, [dateFilter, searchUsername, sortBy, outlooks]);
+
+      useEffect(() => {
+        waitForLeaflet(() => {
+          try {
+            console.log('Initializing Leaflet for ViewOutlookPage');
+            const map = L.map('view-map').setView([54.5, -3], 6);
+            mapRef.current = map;
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+              maxZoom: 19,
+              attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+            }).addTo(map).on('tileerror', error => {
+              console.error('Tile error:', error);
+              setError('Failed to load map tiles');
+            });
+            setTimeout(() => {
+              map.invalidateSize();
+              console.log('Map size invalidated for ViewOutlookPage');
+            }, 100);
+            return () => {
+              console.log('Cleaning up ViewOutlookPage map');
+              map.remove();
+            };
+          } catch (err) {
+            console.error('Error initializing ViewOutlookPage map:', err);
+            setError('Failed to initialize map');
+          }
+        });
+      }, []);
+
+      useEffect(() => {
+        if (!mapRef.current || !selectedOutlook) return;
+        console.log('Updating GeoJSON for outlook:', selectedOutlook.id);
+        geoJsonLayersRef.current.forEach(layer => {
+          if (mapRef.current.hasLayer(layer)) {
+            mapRef.current.removeLayer(layer);
+          }
+        });
+        geoJsonLayersRef.current = [];
+        if (selectedOutlook.polygons) {
+          const parsedPolygons = selectedOutlook.polygons
+            .map(p => {
+              try {
+                return {
+                  ...p,
+                  geometry: {
+                    ...p.geometry,
+                    coordinates: JSON.parse(p.geometry.coordinates)
+                  },
+                  properties: {
+                    ...p.properties,
+                    Name: p.properties.Name || 'low risk',
+                    color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk']
+                  }
+                };
+              } catch (err) {
+                console.error('Error parsing polygon:', p, err);
+                return null;
+              }
+            }).filter(p => p !== null);
+          console.log('Parsed polygons for ViewOutlookPage:', parsedPolygons.length);
+
+          const polygonsByRisk = RISK_ORDER.reduce((acc, risk) => {
+            acc[risk] = parsedPolygons.filter(p => p.properties.Name?.toLowerCase() === risk);
+            return acc;
+          }, {});
+          console.log('Polygons by risk:', polygonsByRisk);
+
+          RISK_ORDER.forEach(risk => {
+            if (polygonsByRisk[risk].length) {
+              const layer = L.geoJSON(polygonsByRisk[risk], {
+                style: feature => {
+                  const riskLevel = feature.properties.Name?.toLowerCase() || 'low risk';
+                  const color = RISK_COLORS[riskLevel] || '#66c2a4';
+                  if (!RISK_COLORS[riskLevel]) {
+                    console.warn('Invalid risk level:', riskLevel, 'for polygon', feature);
+                  }
+                  console.log('Assigning color for', feature.properties.Name, ':', color);
+                  return {
+                    color,
+                    fillColor: color,
+                    fillOpacity: 0.4
+                  };
+                }
+              }).addTo(mapRef.current);
+              geoJsonLayersRef.current.push(layer);
+              console.log('Added GeoJSON layer for', risk);
+            }
+          });
+          setTimeout(() => {
+            if (mapRef.current) {
+              mapRef.current.invalidateSize();
+              console.log('Map size invalidated after GeoJSON layer update');
+            }
+          }, 100);
+        }
+      }, [selectedOutlook]);
+
+      const formatTimestamp = (timestamp) => {
+        if (!timestamp) return 'Unknown';
+        try {
+          const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+          return date.toLocaleString('en-GB', {
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZone: 'Europe/London'
+          });
+        } catch {
+          return 'Unknown';
+        }
+      };
+
+      return (
+        <div className="p-6 container mx-auto">
+          <h1 className="text-3xl font-bold text-gray-800 mb-6">View Outlooks</h1>
+          {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
+          <div className="flex flex-col md:flex-row gap-6">
+            <div className="md:w-1/3 bg-white p-6 rounded-lg shadow-md">
+              <div className="mb-4">
+                <label className="block text-gray-700 mb-2">Filter by Date</label>
+                <input
+                  type="date"
+                  value={dateFilter}
+                  onChange={e => setDateFilter(e.target.value)}
+                  min={new Date().toISOString().split('T')[0]}
+                  className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div className="mb-4">
+                <label className="block text-gray-700 mb-2">Search by Username</label>
+                <input
+                  type="text"
+                  value={searchUsername}
+                  onChange={e => setSearchUsername(e.target.value)}
+                  placeholder="Enter username"
+                  className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div className="mb-4">
+                <label className="block text-gray-700 mb-2">Sort By</label>
+                <select
+                  value={sortBy}
+                  onChange={e => setSortBy(e.target.value)}
+                  className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="latest">Latest Published</option>
+                  <option value="mostLikes">Most Likes</option>
+                </select>
+              </div>
+              <ul className="space-y-2 max-h-60 overflow-y-auto">
+                {filteredOutlooks.map(outlook => (
+                  <li
+                    key={outlook.id}
+                    onClick={() => setSelectedOutlook(outlook)}
+                    className="cursor-pointer p-3 hover:bg-gray-100 rounded-lg"
+                  >
+                    {outlook.username} - {outlook.date} (Score: Pending)
+                    <br />
+                    Likes: {outlook.likes?.length || 0} | Published: {formatTimestamp(outlook.createdAt)}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleLike(outlook.id);
+                      }}
+                      className="ml-2 text-blue-500 hover:text-blue-700"
+                    >
+                      Like
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div className="md:w-2/3">
+              <div id="view-map" className="h-[500px] w-full rounded-lg shadow-md"></div>
+            </div>
+          </div>
+        </div>
+      );
+    };
     
     
     const YourUploadsPage = ({ user, username, email }) => {
@@ -3099,4 +3358,4 @@ const LeaderboardPage = () => {
     );
   </script>
 </body>
-</html>
+</html> 
